@@ -85,7 +85,32 @@ func (h *fileHandler) deliverFile(w http.ResponseWriter, r *http.Request, p http
 }
 
 func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
-	// TODO: implement
+	drawerName := p.ByName("drawer")
+	filename := p.ByName("file")
+
+	if drawerName == "" || filename == "" {
+		http.Error(w, "Not found", http.StatusNotAcceptable)
+	}
+
+	err := h.DB.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(drawerName))
+		if bucket == nil {
+			return errors.New("unknown drawer")
+		}
+		if err := bucket.Delete([]byte(filename)); err != nil {
+			return err
+		}
+		if err := bucket.Delete([]byte("." + filename + ".mimetype")); err != nil {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		http.Error(w, "Deleting file failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *fileHandler) uploadFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
