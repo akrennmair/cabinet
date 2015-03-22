@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 	"time"
 
 	"github.com/akrennmair/gouuid"
@@ -20,22 +21,37 @@ func main() {
 	var (
 		listenAddr = flag.String("listen", "localhost:8080", "listen address")
 		dataFile   = flag.String("datafile", "./data.db", "path to data file")
+		username   = flag.String("user", "admin", "user name for operations requiring authentication")
+		password   = flag.String("pass", "", "password for operations requiring authentication")
+		frontend   = flag.String("frontend", "", "front-facing URL for the file delivery")
 	)
 
 	flag.Parse()
+
+	if *username == "" || *password == "" {
+		log.Fatal("You need to provide username and password!")
+	}
+
+	if *frontend == "" {
+		log.Fatal("You need to provide a front-facing URL, e.g. http://localhost:8080")
+	}
+
+	if _, err := url.Parse(*frontend); err != nil {
+		log.Fatalf("Invalid front-facing URL: %v", err)
+	}
 
 	db, err := bolt.Open(*dataFile, 0600, nil)
 	if err != nil {
 		log.Fatalf("bolt.Open %s failed: %v", *dataFile, err)
 	}
 
-	fh := &fileHandler{DB: db}
+	fh := &fileHandler{DB: db, Frontend: *frontend}
 
 	router := httprouter.New()
 
 	router.GET("/:drawer/:file", fh.deliverFile)
-	router.DELETE("/:drawer/:file", fh.deleteFile)
-	router.POST("/api/upload", fh.uploadFile)
+	router.DELETE("/:drawer/:file", basicAuth(fh.deleteFile, []byte(*username), []byte(*password)))
+	router.POST("/api/upload", basicAuth(fh.uploadFile, []byte(*username), []byte(*password)))
 
 	http.Handle("/", router)
 
@@ -43,7 +59,8 @@ func main() {
 }
 
 type fileHandler struct {
-	DB *bolt.DB
+	DB       *bolt.DB
+	Frontend string
 }
 
 func (h *fileHandler) deliverFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
@@ -135,7 +152,6 @@ func (h *fileHandler) uploadFile(w http.ResponseWriter, r *http.Request, p httpr
 				return err
 			}
 			bucket = b
-			// TODO: make bucket creation an explicit operation whenever credentials for file upload are introduced.
 		}
 
 		multipartReader, err := r.MultipartReader()
@@ -172,7 +188,7 @@ func (h *fileHandler) uploadFile(w http.ResponseWriter, r *http.Request, p httpr
 				return err
 			}
 
-			filenames = append(filenames, filename)
+			filenames = append(filenames, h.Frontend+"/"+drawerName+"/"+filename)
 		}
 		return nil
 	})

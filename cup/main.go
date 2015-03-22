@@ -21,6 +21,7 @@ func main() {
 		mimeType        = flag.String("mimetype", "application/octet-stream", "MIME type of file")
 		inputFile       = flag.String("file", "", "file to upload")
 		drawerName      = flag.String("drawer", "", "drawer name")
+		auth            = flag.String("auth", "", "authentication information, provided as username:password")
 	)
 
 	flag.Parse()
@@ -70,7 +71,22 @@ func main() {
 	baseParts := strings.Split(basename, ".")
 	extension := baseParts[len(baseParts)-1]
 
-	resp, err := http.Post(*destinationAddr+"/api/upload?drawer="+*drawerName+"&ext="+extension, mw.FormDataContentType(), &mpBuf)
+	req, err := http.NewRequest("POST", *destinationAddr+"/api/upload?drawer="+*drawerName+"&ext="+extension, &mpBuf)
+	if err != nil {
+		fmt.Printf("Error: couldn't create request: %v\n", err)
+		return
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	if *auth != "" {
+		elems := strings.Split(*auth, ":")
+		if len(elems) != 2 {
+			fmt.Println("Error: authentication information must be in the format username:password!")
+			return
+		}
+		req.SetBasicAuth(elems[0], elems[1])
+	}
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Printf("Error: upload failed: %v\n", err)
 		return
