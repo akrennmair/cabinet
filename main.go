@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -51,27 +50,33 @@ func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request, p httpr
 }
 
 func (h *fileHandler) uploadFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
-	if err := r.ParseMultipartForm(64 * 1024 * 1024); err != nil {
+	if err := r.ParseForm(); err != nil {
 		http.Error(w, "parsing multipart form failed: "+err.Error(), http.StatusNotAcceptable)
 		return
 	}
 
-	cabinetName := r.Form.Get("cabinet")
-	if cabinetName == "" {
-		http.Error(w, "no cabinet name provided", http.StatusNotAcceptable)
+	drawerName := r.Form.Get("drawer")
+	if drawerName == "" {
+		http.Error(w, "no drawer name provided", http.StatusNotAcceptable)
 		return
 	}
 
 	var filenames []string
 
 	err := h.DB.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket([]byte(cabinetName))
+		bucket := tx.Bucket([]byte(drawerName))
 		if bucket == nil {
-			return fmt.Errorf("unknown cabinet %s", cabinetName)
+			b, err := tx.CreateBucket([]byte(drawerName))
+			if err != nil {
+				return err
+			}
+			bucket = b
+			// TODO: make bucket creation an explicit operation whenever credentials for file upload are introduced.
 		}
 
 		multipartReader, err := r.MultipartReader()
 		if err != nil {
+			log.Printf("Getting MultipartReader failed: %v", err)
 			return err
 		}
 
