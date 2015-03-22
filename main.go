@@ -2,11 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
+	"time"
 
 	"github.com/akrennmair/gouuid"
 	"github.com/boltdb/bolt"
@@ -34,7 +37,9 @@ func main() {
 	router.DELETE("/:drawer/:file", fh.deleteFile)
 	router.POST("/api/upload", fh.uploadFile)
 
-	log.Fatal(http.ListenAndServe(*listenAddr, router))
+	http.Handle("/", router)
+
+	log.Fatal(http.ListenAndServe(*listenAddr, nil))
 }
 
 type fileHandler struct {
@@ -42,7 +47,41 @@ type fileHandler struct {
 }
 
 func (h *fileHandler) deliverFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
-	// TODO: implement
+	ts := time.Now()
+	defer func() {
+		duration := time.Since(ts)
+		log.Printf("deliverying %s took %s", r.RequestURI, duration)
+	}()
+	drawer := p.ByName("drawer")
+	if drawer == "" {
+		http.Error(w, "no drawer specified", http.StatusNotFound)
+		return
+	}
+
+	filename := p.ByName("file")
+	if filename == "" {
+		http.Error(w, "no filename specified", http.StatusNotFound)
+		return
+	}
+
+	err := h.DB.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(drawer))
+		if bucket == nil {
+			return errors.New("unknown bucket")
+		}
+
+		fileContent := bucket.Get([]byte(filename))
+		mimeType := bucket.Get([]byte("." + filename + ".mimetype"))
+
+		w.Header().Set("Content-Type", string(mimeType))
+		w.Write(fileContent)
+		return nil
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("delivery failed: %v", err)
+		return
+	}
 }
 
 func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
