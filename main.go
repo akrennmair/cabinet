@@ -45,7 +45,11 @@ func main() {
 		log.Fatalf("bolt.Open %s failed: %v", *dataFile, err)
 	}
 
-	fh := &fileHandler{DB: db, Frontend: *frontend}
+	events := make(chan event)
+
+	go logEvents(events, db)
+
+	fh := &fileHandler{DB: db, Frontend: *frontend, Events: events}
 
 	router := httprouter.New()
 
@@ -61,17 +65,18 @@ func main() {
 type fileHandler struct {
 	DB       *bolt.DB
 	Frontend string
+	Events   chan<- event
 }
 
 func (h *fileHandler) deliverFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
 	ts := time.Now()
 	defer func() {
 		duration := time.Since(ts)
-		log.Printf("deliverying %s took %s", r.RequestURI, duration)
+		log.Printf("delivering %s took %s", r.RequestURI, duration)
 	}()
 	drawer := p.ByName("drawer")
-	if drawer == "" {
-		http.Error(w, "no drawer specified", http.StatusNotFound)
+	if !isValidDrawerName(drawer) {
+		http.Error(w, "no valid drawer specified", http.StatusNotFound)
 		return
 	}
 
@@ -105,7 +110,7 @@ func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request, p httpr
 	drawerName := p.ByName("drawer")
 	filename := p.ByName("file")
 
-	if drawerName == "" || filename == "" {
+	if !isValidDrawerName(drawerName) || filename == "" {
 		http.Error(w, "Not found", http.StatusNotAcceptable)
 	}
 
@@ -128,21 +133,30 @@ func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request, p httpr
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+	h.Events <- event{Type: deleteFileEvent, Drawer: drawerName, File: filename}
 }
 
 func (h *fileHandler) uploadFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
+	ts := time.Now()
+	defer func() {
+		duration := time.Since(ts)
+		log.Printf("upload took %s", duration)
+	}()
+
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "parsing multipart form failed: "+err.Error(), http.StatusNotAcceptable)
 		return
 	}
 
 	drawerName := r.Form.Get("drawer")
-	if drawerName == "" {
-		http.Error(w, "no drawer name provided", http.StatusNotAcceptable)
+	if !isValidDrawerName(drawerName) {
+		http.Error(w, "no valid drawer name provided", http.StatusNotAcceptable)
 		return
 	}
 
 	var filenames []string
+
+	var events []event
 
 	err := h.DB.Update(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte(drawerName))
@@ -189,6 +203,8 @@ func (h *fileHandler) uploadFile(w http.ResponseWriter, r *http.Request, p httpr
 			}
 
 			filenames = append(filenames, h.Frontend+"/"+drawerName+"/"+filename)
+
+			events = append(events, event{Type: uploadFileEvent, Drawer: drawerName, File: filename})
 		}
 		return nil
 	})
@@ -202,5 +218,9 @@ func (h *fileHandler) uploadFile(w http.ResponseWriter, r *http.Request, p httpr
 		http.Error(w, "Marshalling JSON failed: "+err.Error(), http.StatusInternalServerError)
 		log.Printf("marshalling list of filenames to JSON failed: %v", err)
 		return
+	}
+
+	for _, event := range events {
+		h.Events <- event
 	}
 }
