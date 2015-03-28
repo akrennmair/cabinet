@@ -49,7 +49,7 @@ func main() {
 
 	events := make(chan *data.Event)
 
-	//go logEvents(events, db)
+	go dispatchEvents(events)
 
 	fh := &fileHandler{DB: db, Frontend: *frontend, Events: events}
 
@@ -215,7 +215,7 @@ func (h *fileHandler) uploadFile(w http.ResponseWriter, r *http.Request, p httpr
 		batch.Put([]byte("meta:"+drawerName+":"+filename), rawMetaData)
 
 		event := &data.Event{
-			Type:     data.Event_DELETE.Enum(),
+			Type:     data.Event_UPLOAD.Enum(),
 			Drawer:   proto.String(drawerName),
 			Filename: proto.String(filename),
 		}
