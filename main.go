@@ -10,12 +10,12 @@ import (
 	_ "net/http/pprof"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/akrennmair/cabinet/data"
 	"github.com/akrennmair/gouuid"
 	"github.com/golang/protobuf/proto"
-	"github.com/julienschmidt/httprouter"
 	"github.com/syndtr/goleveldb/leveldb"
 )
 
@@ -51,40 +51,47 @@ func main() {
 
 	go dispatchEvents(events)
 
-	fh := &fileHandler{DB: db, Frontend: *frontend, Events: events}
-
-	router := httprouter.New()
-
-	router.GET("/:drawer/:file", fh.deliverFile)
-	router.DELETE("/:drawer/:file", basicAuth(fh.deleteFile, []byte(*username), []byte(*password)))
-	router.POST("/api/upload", basicAuth(fh.uploadFile, []byte(*username), []byte(*password)))
-
-	http.Handle("/", router)
+	http.Handle("/api/upload", basicAuth(&uploadFileHandler{DB: db, Frontend: *frontend, Events: events}, []byte(*username), []byte(*password)))
+	http.Handle("/", &fileHandler{DB: db, Events: events, Username: *username, Password: *password})
 
 	log.Fatal(http.ListenAndServe(*listenAddr, nil))
 }
 
 type fileHandler struct {
 	DB       *leveldb.DB
-	Frontend string
 	Events   chan<- *data.Event
+	Username string
+	Password string
 }
 
-func (h *fileHandler) deliverFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
+func (h *fileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "DELETE" {
+		basicAuth(http.HandlerFunc(h.deleteFile), []byte(h.Username), []byte(h.Password)).ServeHTTP(w, r)
+		return
+	}
+
+	if r.Method == "GET" {
+		h.deliverFile(w, r)
+		return
+	}
+}
+
+func (h *fileHandler) deliverFile(w http.ResponseWriter, r *http.Request) {
 	ts := time.Now()
 	defer func() {
 		duration := time.Since(ts)
 		log.Printf("delivering %s took %s", r.RequestURI, duration)
 	}()
-	drawer := p.ByName("drawer")
-	if drawer == "" {
-		http.Error(w, "no valid drawer specified", http.StatusNotFound)
+
+	uriParts := strings.Split(r.URL.Path[1:], "/")
+	if len(uriParts) != 2 {
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		return
 	}
 
-	filename := p.ByName("file")
-	if filename == "" {
-		http.Error(w, "no filename specified", http.StatusNotFound)
+	drawer, filename := uriParts[0], uriParts[1]
+	if drawer == "" || filename == "" {
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		return
 	}
 
@@ -114,12 +121,22 @@ func (h *fileHandler) deliverFile(w http.ResponseWriter, r *http.Request, p http
 	}
 }
 
-func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
-	drawerName := p.ByName("drawer")
-	filename := p.ByName("file")
+func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request) {
+	uriParts := strings.Split(r.URL.Path[1:], "/")
+	if len(uriParts) != 2 {
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		return
+	}
 
-	if drawerName == "" || filename == "" {
-		http.Error(w, "Not found", http.StatusNotAcceptable)
+	drawerName := uriParts[0]
+	if drawerName == "" {
+		http.Error(w, "no valid drawer specified", http.StatusNotFound)
+		return
+	}
+
+	filename := uriParts[1]
+	if filename == "" {
+		http.Error(w, "no filename specified", http.StatusNotFound)
 		return
 	}
 
@@ -149,7 +166,18 @@ func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request, p httpr
 	h.Events <- event
 }
 
-func (h *fileHandler) uploadFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
+type uploadFileHandler struct {
+	DB       *leveldb.DB
+	Frontend string
+	Events   chan<- *data.Event
+}
+
+func (h *uploadFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
 	ts := time.Now()
 	defer func() {
 		duration := time.Since(ts)

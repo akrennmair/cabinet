@@ -5,13 +5,11 @@ import (
 	"encoding/base64"
 	"net/http"
 	"strings"
-
-	"github.com/julienschmidt/httprouter"
 )
 
-// taken straight from the httprouter README.
-func basicAuth(h httprouter.Handle, user, pass []byte) httprouter.Handle {
-	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+// taken from the httprouter README, adapted.
+func basicAuth(h http.Handler, user, pass []byte) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		const basicAuthPrefix string = "Basic "
 
 		// Get the Basic Authentication credentials
@@ -23,7 +21,7 @@ func basicAuth(h httprouter.Handle, user, pass []byte) httprouter.Handle {
 				pair := bytes.SplitN(payload, []byte(":"), 2)
 				if len(pair) == 2 && bytes.Equal(pair[0], user) && bytes.Equal(pair[1], pass) {
 					// Delegate request to the given handle
-					h(w, r, ps)
+					h.ServeHTTP(w, r)
 					return
 				}
 			}
@@ -32,5 +30,5 @@ func basicAuth(h httprouter.Handle, user, pass []byte) httprouter.Handle {
 		// Request Basic Authentication otherwise
 		w.Header().Set("WWW-Authenticate", "Basic realm=Restricted")
 		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
-	}
+	})
 }
