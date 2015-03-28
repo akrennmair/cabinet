@@ -160,7 +160,9 @@ func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
-	batch.Put([]byte("event:"+strconv.FormatInt(time.Now().UnixNano(), 10)), eventData)
+	eventKey := []byte("event:" + strconv.FormatInt(time.Now().UnixNano(), 10))
+	batch.Put(eventKey, eventData)
+	batch.Put([]byte("latest_event"), eventKey)
 
 	if err := h.DB.Write(batch, nil); err != nil {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -264,7 +266,9 @@ func (h *uploadFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		batch.Put([]byte("event:"+strconv.FormatInt(time.Now().UnixNano(), 10)), eventData)
+		eventKey := []byte("event:" + strconv.FormatInt(time.Now().UnixNano(), 10))
+		batch.Put(eventKey, eventData)
+		batch.Put([]byte("latest_event"), eventKey)
 
 		filenames = append(filenames, h.Frontend+"/"+drawerName+"/"+filename)
 		events = append(events, event)
