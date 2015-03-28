@@ -1,0 +1,16 @@
+package data;
+
+message Event {
+	enum Type {
+		UPLOAD = 1;
+		DELETE = 2;
+	}
+
+	required Type type = 1;
+	required string drawer = 2;
+	required string filename = 3;
+}
+
+message MetaData {
+	required string content_type = 1;
+}

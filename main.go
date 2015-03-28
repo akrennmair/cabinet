@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"flag"
 	"io"
 	"io/ioutil"
@@ -10,11 +9,14 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
+	"strconv"
 	"time"
 
+	"github.com/akrennmair/cabinet/data"
 	"github.com/akrennmair/gouuid"
-	"github.com/boltdb/bolt"
+	"github.com/golang/protobuf/proto"
 	"github.com/julienschmidt/httprouter"
+	"github.com/syndtr/goleveldb/leveldb"
 )
 
 func main() {
@@ -40,14 +42,14 @@ func main() {
 		log.Fatalf("Invalid front-facing URL: %v", err)
 	}
 
-	db, err := bolt.Open(*dataFile, 0600, nil)
+	db, err := leveldb.OpenFile(*dataFile, nil)
 	if err != nil {
-		log.Fatalf("bolt.Open %s failed: %v", *dataFile, err)
+		log.Fatalf("leveldb.OpenFile %s failed: %v", *dataFile, err)
 	}
 
-	events := make(chan event)
+	events := make(chan *data.Event)
 
-	go logEvents(events, db)
+	//go logEvents(events, db)
 
 	fh := &fileHandler{DB: db, Frontend: *frontend, Events: events}
 
@@ -63,9 +65,9 @@ func main() {
 }
 
 type fileHandler struct {
-	DB       *bolt.DB
+	DB       *leveldb.DB
 	Frontend string
-	Events   chan<- event
+	Events   chan<- *data.Event
 }
 
 func (h *fileHandler) deliverFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
@@ -75,7 +77,7 @@ func (h *fileHandler) deliverFile(w http.ResponseWriter, r *http.Request, p http
 		log.Printf("delivering %s took %s", r.RequestURI, duration)
 	}()
 	drawer := p.ByName("drawer")
-	if !isValidDrawerName(drawer) {
+	if drawer == "" {
 		http.Error(w, "no valid drawer specified", http.StatusNotFound)
 		return
 	}
@@ -86,23 +88,29 @@ func (h *fileHandler) deliverFile(w http.ResponseWriter, r *http.Request, p http
 		return
 	}
 
-	err := h.DB.View(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket([]byte(drawer))
-		if bucket == nil {
-			return errors.New("unknown bucket")
-		}
-
-		fileContent := bucket.Get([]byte(filename))
-		mimeType := bucket.Get([]byte("." + filename + ".mimetype"))
-
-		w.Header().Set("Content-Type", string(mimeType))
-		w.Write(fileContent)
-		return nil
-	})
+	fileContent, err := h.DB.Get([]byte("file:"+drawer+":"+filename), nil)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		log.Printf("delivery failed: %v", err)
+		http.Error(w, http.StatusText(http.StatusNoContent), http.StatusNotFound)
 		return
+	}
+
+	var metadata data.MetaData
+
+	rawMetaData, err := h.DB.Get([]byte("meta:"+drawer+":"+filename), nil)
+	if err != nil {
+		log.Printf("couldn't find metadata for %s:%s: %v", drawer, filename, err)
+		metadata.ContentType = proto.String("application/octet-stream")
+	} else {
+		if err := proto.Unmarshal(rawMetaData, &metadata); err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			log.Printf("proto.Unmarshal of metadata for %s:%s failed: %v", drawer, filename, err)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", metadata.GetContentType())
+	if _, err := w.Write(fileContent); err != nil {
+		log.Printf("delivery of %s:%s failed: %v", drawer, filename, err)
 	}
 }
 
@@ -110,30 +118,35 @@ func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request, p httpr
 	drawerName := p.ByName("drawer")
 	filename := p.ByName("file")
 
-	if !isValidDrawerName(drawerName) || filename == "" {
+	if drawerName == "" || filename == "" {
 		http.Error(w, "Not found", http.StatusNotAcceptable)
+		return
 	}
 
-	err := h.DB.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket([]byte(drawerName))
-		if bucket == nil {
-			return errors.New("unknown drawer")
-		}
-		if err := bucket.Delete([]byte(filename)); err != nil {
-			return err
-		}
-		if err := bucket.Delete([]byte("." + filename + ".mimetype")); err != nil {
-			return err
-		}
+	batch := new(leveldb.Batch)
+	batch.Delete([]byte("file:" + drawerName + ":" + filename))
+	batch.Delete([]byte("meta:" + drawerName + ":" + filename))
 
-		return nil
-	})
+	event := &data.Event{
+		Type:     data.Event_DELETE.Enum(),
+		Drawer:   proto.String(drawerName),
+		Filename: proto.String(filename),
+	}
+
+	eventData, err := proto.Marshal(event)
 	if err != nil {
-		http.Error(w, "Deleting file failed: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+	batch.Put([]byte("event:"+strconv.FormatInt(time.Now().UnixNano(), 10)), eventData)
+
+	if err := h.DB.Write(batch, nil); err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		log.Printf("deleting file %s:%s failed: %v", drawerName, filename, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-	h.Events <- event{Type: deleteFileEvent, Drawer: drawerName, File: filename}
+	h.Events <- event
 }
 
 func (h *fileHandler) uploadFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
@@ -149,73 +162,83 @@ func (h *fileHandler) uploadFile(w http.ResponseWriter, r *http.Request, p httpr
 	}
 
 	drawerName := r.Form.Get("drawer")
-	if !isValidDrawerName(drawerName) {
+	if drawerName == "" {
 		http.Error(w, "no valid drawer name provided", http.StatusNotAcceptable)
 		return
 	}
 
 	var filenames []string
 
-	var events []event
+	var events []*data.Event
 
-	err := h.DB.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket([]byte(drawerName))
-		if bucket == nil {
-			b, err := tx.CreateBucket([]byte(drawerName))
-			if err != nil {
-				return err
-			}
-			bucket = b
-		}
+	batch := new(leveldb.Batch)
 
-		multipartReader, err := r.MultipartReader()
-		if err != nil {
-			log.Printf("Getting MultipartReader failed: %v", err)
-			return err
-		}
-
-		for {
-			part, err := multipartReader.NextPart()
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				return err
-			}
-
-			uuid := gouuid.New()
-			partData, err := ioutil.ReadAll(part)
-			if err != nil {
-				return err
-			}
-
-			filename := uuid.ShortString()
-			if extension := r.Form.Get("ext"); extension != "" {
-				filename += "." + extension
-			}
-
-			if err := bucket.Put([]byte(filename), partData); err != nil {
-				return err
-			}
-
-			if err := bucket.Put([]byte("."+filename+".mimetype"), []byte(part.Header.Get("Content-Type"))); err != nil {
-				return err
-			}
-
-			filenames = append(filenames, h.Frontend+"/"+drawerName+"/"+filename)
-
-			events = append(events, event{Type: uploadFileEvent, Drawer: drawerName, File: filename})
-		}
-		return nil
-	})
+	multipartReader, err := r.MultipartReader()
 	if err != nil {
-		http.Error(w, "upload failed: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		log.Printf("Getting MultipartReader failed: %v", err)
+		return
+	}
+
+	for {
+		part, err := multipartReader.NextPart()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+
+		uuid := gouuid.New()
+		partData, err := ioutil.ReadAll(part)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+
+		filename := uuid.ShortString()
+		if extension := r.Form.Get("ext"); extension != "" {
+			filename += "." + extension
+		}
+		batch.Put([]byte("file:"+drawerName+":"+filename), partData)
+
+		var metadata data.MetaData
+		metadata.ContentType = proto.String(part.Header.Get("Content-Type"))
+		rawMetaData, err := proto.Marshal(&metadata)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			log.Printf("proto.Marshal failed: %v", err)
+			return
+		}
+
+		batch.Put([]byte("meta:"+drawerName+":"+filename), rawMetaData)
+
+		event := &data.Event{
+			Type:     data.Event_DELETE.Enum(),
+			Drawer:   proto.String(drawerName),
+			Filename: proto.String(filename),
+		}
+
+		eventData, err := proto.Marshal(event)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		batch.Put([]byte("event:"+strconv.FormatInt(time.Now().UnixNano(), 10)), eventData)
+
+		filenames = append(filenames, h.Frontend+"/"+drawerName+"/"+filename)
+		events = append(events, event)
+	}
+
+	if err := h.DB.Write(batch, nil); err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		log.Printf("upload transaction failed: %v", err)
 		return
 	}
 
 	if err := json.NewEncoder(w).Encode(filenames); err != nil {
-		http.Error(w, "Marshalling JSON failed: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		log.Printf("marshalling list of filenames to JSON failed: %v", err)
 		return
 	}
