@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"io"
@@ -51,7 +53,7 @@ func main() {
 
 	go dispatchEvents(events)
 
-	http.Handle("/api/upload", basicAuth(&uploadFileHandler{DB: db, Frontend: *frontend, Events: events}, []byte(*username), []byte(*password)))
+	http.Handle("/api/upload", &uploadFileHandler{DB: db, Frontend: *frontend, Events: events, Username: *username, Password: *password})
 	http.Handle("/", &fileHandler{DB: db, Events: events, Username: *username, Password: *password})
 
 	log.Fatal(http.ListenAndServe(*listenAddr, nil))
@@ -65,14 +67,13 @@ type fileHandler struct {
 }
 
 func (h *fileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "DELETE" {
-		basicAuth(http.HandlerFunc(h.deleteFile), []byte(h.Username), []byte(h.Password)).ServeHTTP(w, r)
-		return
-	}
-
-	if r.Method == "GET" {
+	switch r.Method {
+	case "DELETE":
+		h.deleteFile(w, r)
+	case "GET":
 		h.deliverFile(w, r)
-		return
+	default:
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 	}
 }
 
@@ -122,6 +123,10 @@ func (h *fileHandler) deliverFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request) {
+	if !basicAuth(w, r, h.Username, h.Password) {
+		return
+	}
+
 	uriParts := strings.Split(r.URL.Path[1:], "/")
 	if len(uriParts) != 2 {
 		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
@@ -170,11 +175,17 @@ type uploadFileHandler struct {
 	DB       *leveldb.DB
 	Frontend string
 	Events   chan<- *data.Event
+	Username string
+	Password string
 }
 
 func (h *uploadFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
+	if !basicAuth(w, r, h.Username, h.Password) {
 		return
 	}
 
@@ -274,4 +285,27 @@ func (h *uploadFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, event := range events {
 		h.Events <- event
 	}
+}
+
+func basicAuth(w http.ResponseWriter, r *http.Request, user, pass string) bool {
+	const basicAuthPrefix string = "Basic "
+
+	// Get the Basic Authentication credentials
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, basicAuthPrefix) {
+		// Check credentials
+		payload, err := base64.StdEncoding.DecodeString(auth[len(basicAuthPrefix):])
+		if err == nil {
+			pair := bytes.SplitN(payload, []byte(":"), 2)
+			if len(pair) == 2 && bytes.Equal(pair[0], []byte(user)) && bytes.Equal(pair[1], []byte(pass)) {
+				// Delegate request to the given handle
+				return true
+			}
+		}
+	}
+
+	// Request Basic Authentication otherwise
+	w.Header().Set("WWW-Authenticate", "Basic realm=Restricted")
+	http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+	return false
 }
