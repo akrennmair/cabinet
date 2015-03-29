@@ -119,6 +119,11 @@ func (r *replicator) replicateUntilError() error {
 			return err
 		}
 
+		if haveEvent, _ := r.DB.Has([]byte(event.GetId()), nil); haveEvent {
+			log.Printf("ignoring duplicate event %s", event.GetId())
+			continue
+		}
+
 		batch := new(leveldb.Batch)
 		batch.Put([]byte(event.GetId()), rawMsg)
 		batch.Put([]byte("latest_event"), []byte(event.GetId()))
