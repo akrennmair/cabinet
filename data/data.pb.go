@@ -11,6 +11,7 @@ It is generated from these files:
 It has these top-level messages:
 	Event
 	MetaData
+	ReplicationStart
 */
 package data
 
@@ -58,6 +59,7 @@ type Event struct {
 	Type             *Event_Type `protobuf:"varint,1,req,name=type,enum=data.Event_Type" json:"type,omitempty"`
 	Drawer           *string     `protobuf:"bytes,2,req,name=drawer" json:"drawer,omitempty"`
 	Filename         *string     `protobuf:"bytes,3,req,name=filename" json:"filename,omitempty"`
+	Id               *string     `protobuf:"bytes,4,req,name=id" json:"id,omitempty"`
 	XXX_unrecognized []byte      `json:"-"`
 }
 
@@ -86,6 +88,13 @@ func (m *Event) GetFilename() string {
 	return ""
 }
 
+func (m *Event) GetId() string {
+	if m != nil && m.Id != nil {
+		return *m.Id
+	}
+	return ""
+}
+
 type MetaData struct {
 	ContentType      *string `protobuf:"bytes,1,req,name=content_type" json:"content_type,omitempty"`
 	XXX_unrecognized []byte  `json:"-"`
@@ -98,6 +107,22 @@ func (*MetaData) ProtoMessage()    {}
 func (m *MetaData) GetContentType() string {
 	if m != nil && m.ContentType != nil {
 		return *m.ContentType
+	}
+	return ""
+}
+
+type ReplicationStart struct {
+	Event            *string `protobuf:"bytes,1,req,name=event" json:"event,omitempty"`
+	XXX_unrecognized []byte  `json:"-"`
+}
+
+func (m *ReplicationStart) Reset()         { *m = ReplicationStart{} }
+func (m *ReplicationStart) String() string { return proto.CompactTextString(m) }
+func (*ReplicationStart) ProtoMessage()    {}
+
+func (m *ReplicationStart) GetEvent() string {
+	if m != nil && m.Event != nil {
+		return *m.Event
 	}
 	return ""
 }

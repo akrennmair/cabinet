@@ -19,6 +19,7 @@ import (
 	"github.com/akrennmair/gouuid"
 	"github.com/golang/protobuf/proto"
 	"github.com/syndtr/goleveldb/leveldb"
+	"golang.org/x/net/websocket"
 )
 
 func main() {
@@ -28,9 +29,12 @@ func main() {
 		username   = flag.String("user", "admin", "user name for operations requiring authentication")
 		password   = flag.String("pass", "", "password for operations requiring authentication")
 		frontend   = flag.String("frontend", "", "front-facing URL for the file delivery")
+		parent     = flag.String("parent", "", "parent server URL, e.g. http://otherserver:8080")
 	)
 
 	flag.Parse()
+
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	if *username == "" || *password == "" {
 		log.Fatal("You need to provide username and password!")
@@ -51,24 +55,42 @@ func main() {
 
 	events := make(chan *data.Event)
 
-	go dispatchEvents(events)
+	// start replication from parent server when in child mode.
+	if *parent != "" {
+		r := replicator{ParentServer: *parent, DB: db, Username: *username, Password: *password}
+		go r.replicate()
+	}
 
-	http.Handle("/api/upload", &uploadFileHandler{DB: db, Frontend: *frontend, Events: events, Username: *username, Password: *password})
-	http.Handle("/", &fileHandler{DB: db, Events: events, Username: *username, Password: *password})
+	replRequests := make(chan replRequest)
+
+	go dispatchEvents(events, replRequests)
+
+	// only enable upload when in parent mode.
+	if *parent == "" {
+		http.Handle("/api/upload", &uploadFileHandler{DB: db, Frontend: *frontend, Events: events, Username: *username, Password: *password})
+	}
+	repl := &replHandler{DB: db, Username: *username, Password: *password, Replicator: replRequests}
+	http.Handle("/api/repl", websocket.Handler(repl.handleWebsocket))
+	http.Handle("/", &fileHandler{DB: db, Events: events, Username: *username, Password: *password, ChildMode: *parent != ""})
 
 	log.Fatal(http.ListenAndServe(*listenAddr, nil))
 }
 
 type fileHandler struct {
-	DB       *leveldb.DB
-	Events   chan<- *data.Event
-	Username string
-	Password string
+	DB        *leveldb.DB
+	Events    chan<- *data.Event
+	Username  string
+	Password  string
+	ChildMode bool
 }
 
 func (h *fileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "DELETE":
+		if h.ChildMode {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
 		h.deleteFile(w, r)
 	case "GET":
 		h.deliverFile(w, r)
@@ -149,10 +171,12 @@ func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request) {
 	batch.Delete([]byte("file:" + drawerName + ":" + filename))
 	batch.Delete([]byte("meta:" + drawerName + ":" + filename))
 
+	eventKey := "event:" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	event := &data.Event{
 		Type:     data.Event_DELETE.Enum(),
 		Drawer:   proto.String(drawerName),
 		Filename: proto.String(filename),
+		Id:       proto.String(eventKey),
 	}
 
 	eventData, err := proto.Marshal(event)
@@ -160,9 +184,8 @@ func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
-	eventKey := []byte("event:" + strconv.FormatInt(time.Now().UnixNano(), 10))
-	batch.Put(eventKey, eventData)
-	batch.Put([]byte("latest_event"), eventKey)
+	batch.Put([]byte(eventKey), eventData)
+	batch.Put([]byte("latest_event"), []byte(eventKey))
 
 	if err := h.DB.Write(batch, nil); err != nil {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -255,10 +278,12 @@ func (h *uploadFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		batch.Put([]byte("meta:"+drawerName+":"+filename), rawMetaData)
 
+		eventKey := "event:" + strconv.FormatInt(time.Now().UnixNano(), 10)
 		event := &data.Event{
 			Type:     data.Event_UPLOAD.Enum(),
 			Drawer:   proto.String(drawerName),
 			Filename: proto.String(filename),
+			Id:       proto.String(eventKey),
 		}
 
 		eventData, err := proto.Marshal(event)
@@ -266,9 +291,8 @@ func (h *uploadFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
-		eventKey := []byte("event:" + strconv.FormatInt(time.Now().UnixNano(), 10))
-		batch.Put(eventKey, eventData)
-		batch.Put([]byte("latest_event"), eventKey)
+		batch.Put([]byte(eventKey), eventData)
+		batch.Put([]byte("latest_event"), []byte(eventKey))
 
 		filenames = append(filenames, h.Frontend+"/"+drawerName+"/"+filename)
 		events = append(events, event)
@@ -308,8 +332,14 @@ func basicAuth(w http.ResponseWriter, r *http.Request, user, pass string) bool {
 		}
 	}
 
-	// Request Basic Authentication otherwise
-	w.Header().Set("WWW-Authenticate", "Basic realm=Restricted")
-	http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+	if w != nil {
+		// Request Basic Authentication otherwise
+		w.Header().Set("WWW-Authenticate", "Basic realm=Restricted")
+		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+	}
 	return false
+}
+
+func basicAuthEncode(user, pass string) string {
+	return base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
 }
