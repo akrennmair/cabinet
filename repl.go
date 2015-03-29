@@ -30,9 +30,9 @@ func dispatchEvents(events <-chan *data.Event, replRequests <-chan replRequest) 
 			log.Printf("finished notifying subscribers")
 		case r := <-replRequests:
 			switch r.Type {
-			case Subscribe:
+			case subscribe:
 				subscribers[r.Events] = struct{}{}
-			case Unsubscribe:
+			case unsubscribe:
 				delete(subscribers, r.Events)
 			}
 		}
@@ -172,8 +172,6 @@ func (r *replicator) replicateUntilError() error {
 
 		log.Printf("replicated %s to %s:%s", event.GetId(), event.GetDrawer(), event.GetFilename())
 	}
-
-	return nil
 }
 
 func (r *replicator) downloadFile(uri string) (content []byte, contentType string, err error) {
@@ -208,8 +206,8 @@ type replRequest struct {
 type replRequestType int
 
 const (
-	Subscribe replRequestType = iota
-	Unsubscribe
+	subscribe replRequestType = iota
+	unsubscribe
 )
 
 func (h *replHandler) handleWebsocket(conn *websocket.Conn) {
@@ -266,10 +264,10 @@ func (h *replHandler) handleWebsocket(conn *websocket.Conn) {
 
 	defer close(rawEvents)
 
-	h.Replicator <- replRequest{Type: Subscribe, Events: events}
+	h.Replicator <- replRequest{Type: subscribe, Events: events}
 
 	defer func() {
-		h.Replicator <- replRequest{Type: Unsubscribe, Events: events}
+		h.Replicator <- replRequest{Type: unsubscribe, Events: events}
 		close(events)
 	}()
 
