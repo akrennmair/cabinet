@@ -5,9 +5,11 @@ import (
 	"golang.org/x/net/websocket"
 	"io/ioutil"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/akrennmair/cabinet/data"
 	"github.com/golang/protobuf/proto"
@@ -22,10 +24,10 @@ func dispatchEvents(events <-chan *data.Event, replRequests <-chan replRequest) 
 		select {
 		case e := <-events:
 			log.Printf("event: %v", e)
-			// TODO: this is a very naive implementation that may block up everything.
 			for ch := range subscribers {
 				ch <- e
 			}
+			log.Printf("finished notifying subscribers")
 		case r := <-replRequests:
 			switch r.Type {
 			case Subscribe:
@@ -45,12 +47,25 @@ type replicator struct {
 }
 
 func (r *replicator) replicate() {
+	count := 0
 	for {
+		ts := time.Now()
 		err := r.replicateUntilError()
 		if err != nil {
 			log.Printf("Replication error: %v", err)
+			if time.Since(ts) < 5*time.Second {
+				if count < 5 {
+					count++
+				}
+			} else {
+				count = 0
+			}
+			if count > 0 {
+				backoffTime := time.Duration(math.Pow(2, float64(count))) * time.Second
+				log.Printf("Backing off for %s", backoffTime)
+				time.Sleep(backoffTime)
+			}
 		}
-		// TODO: implement backing-off strategy here.
 	}
 }
 
@@ -99,19 +114,17 @@ func (r *replicator) replicateUntilError() error {
 		return err
 	}
 
-	if _, err := ws.Write(rawReplStartMsg); err != nil {
+	if err := websocket.Message.Send(ws, rawReplStartMsg); err != nil {
 		log.Printf("sending replication start message failed: %v", err)
 		return err
 	}
 
 	for {
-		var inbuf [2048]byte
-		n, err := ws.Read(inbuf[:])
-		if err != nil {
-			log.Printf("reading event failed: %v", err)
+		var rawMsg []byte
+		if err := websocket.Message.Receive(ws, &rawMsg); err != nil {
+			log.Printf("receiving event failed: %v", err)
 			return err
 		}
-		rawMsg := inbuf[:n]
 
 		var event data.Event
 		if err := proto.Unmarshal(rawMsg, &event); err != nil {
@@ -204,15 +217,12 @@ func (h *replHandler) handleWebsocket(conn *websocket.Conn) {
 		return
 	}
 
-	var inbuf [4096]byte
+	var msg []byte
 
-	n, err := conn.Read(inbuf[:])
-	if err != nil {
-		log.Printf("Reading from replication websocket failed: %v", err)
+	if err := websocket.Message.Receive(conn, &msg); err != nil {
+		log.Printf("Receiving from replication websocket failed: %v", err)
 		return
 	}
-
-	msg := inbuf[:n]
 
 	var replStart data.ReplicationStart
 	if err := proto.Unmarshal(msg, &replStart); err != nil {
@@ -225,37 +235,116 @@ func (h *replHandler) handleWebsocket(conn *websocket.Conn) {
 		return
 	}
 
-	iterator := h.DB.NewIterator(&util.Range{Start: []byte(replStart.GetEvent()), Limit: []byte("f")}, nil)
+	/*
+		this whole replication code works like this:
 
-	for iterator.Next() {
-		eventData := iterator.Value()
-		if _, err := conn.Write(eventData); err != nil {
-			log.Printf("Sending event failed: %v", err)
-			return
-		}
-	}
+		We first register to receive events to replicate them to this connected child.
 
-	events := make(chan *data.Event)
+		We then start a goroutine to cache incoming events (later referred to as
+		"caching goroutine") until we're finished with catching
+		up missing events.
 
-	// TODO: this is an absolutely naive implementation. events between the last
-	// event from the iterator and this replication request get lost. This needs
-	// to be fixed.
+		We then start another goroutine ("forwarding goroutine") that first catches
+		up with missing events by iterating through all events since the last event
+		the child got. We then switch over to forwarding events that have been
+		cached by the caching goroutine.
+
+		We then start a third goroutine ("receiving goroutine") that waits for the
+		websocket to receive a message (which will never happen) or for the
+		connection to close. If the connection is closed, the receivin goroutine
+		closes the quit channel to indicate that replication work needs to be
+		stopped.
+
+		The handleWebsocket method waits for the quit signal, and then returns. Due
+		to a defer, the channel through which we receive events gets unregistered,
+		and the rawEvents channel gets closed, as well. This makes the forwarding
+		goroutine end its operation. The quit signal also ends the caching goroutine.
+
+	*/
+	events := make(chan *data.Event, 1)
+	rawEvents := make(chan []byte)
+
+	defer close(rawEvents)
+
 	h.Replicator <- replRequest{Type: Subscribe, Events: events}
 
 	defer func() {
 		h.Replicator <- replRequest{Type: Unsubscribe, Events: events}
+		close(events)
 	}()
 
-	// TODO: how does this code deal with a disconnecting child?
-	for event := range events {
-		eventData, err := proto.Marshal(event)
-		if err != nil {
-			log.Printf("Marshalling event failed: %v", err)
-			return
+	quit := make(chan bool)
+
+	go cacheEvents(events, rawEvents, quit)
+
+	go func() {
+		iterator := h.DB.NewIterator(&util.Range{Start: []byte(replStart.GetEvent()), Limit: []byte("f")}, nil)
+
+		for iterator.Next() {
+			eventData := iterator.Value()
+			if err := websocket.Message.Send(conn, eventData); err != nil {
+				log.Printf("Sending event failed: %v", err)
+				return
+			}
 		}
-		if _, err := conn.Write(eventData); err != nil {
-			log.Printf("Sending event failed: %v", err)
-			return
+
+		for event := range rawEvents {
+			if err := websocket.Message.Send(conn, event); err != nil {
+				log.Printf("Sending event failed: %v", err)
+				return
+			}
+		}
+
+		log.Printf("stopped sending events to client")
+	}()
+
+	go func() {
+		defer close(quit)
+		for {
+			var inbuf []byte
+			if err := websocket.Message.Receive(conn, &inbuf); err != nil {
+				log.Printf("client has disconnected: %v", err)
+				return
+			}
+		}
+	}()
+
+	<-quit
+	log.Printf("handleWebsocket: received signal to stop replicating to client")
+}
+
+func cacheEvents(incomingEvents <-chan *data.Event, outgoingEvents chan<- []byte, quit <-chan bool) {
+	cachedEvents := [][]byte{}
+
+	for {
+		// if there are currently no cached events, only attempt to receive and listen for
+		// the quit signal.
+		if len(cachedEvents) == 0 {
+			select {
+			case e := <-incomingEvents:
+				rawData, err := proto.Marshal(e)
+				if err != nil {
+					return
+				}
+				cachedEvents = append(cachedEvents, rawData)
+			case <-quit:
+				return
+			}
+		} else {
+			// if there are cached events, attempt to receive, send and listen for the quit
+			// signal.
+			select {
+			case e := <-incomingEvents:
+				rawData, err := proto.Marshal(e)
+				if err != nil {
+					return
+				}
+				cachedEvents = append(cachedEvents, rawData)
+			case outgoingEvents <- cachedEvents[0]:
+				cachedEvents = cachedEvents[1:]
+			case <-quit:
+				return
+			}
 		}
 	}
 }
