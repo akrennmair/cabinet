@@ -29,3 +29,6 @@ deletions, but will instead replicate all uploads and deletions as they happen
 from the `parent` instance. `child` instances can be cascaded, i.e. one `child` 
 can replicate from another `child`.
 
+Whenever a `child` gets disconnected from its `parent`, it attempts to 
+automatically reconnect and catch up with any uploads or deletions that 
+happened during the disconnect time.
