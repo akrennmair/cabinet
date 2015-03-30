@@ -44,6 +44,7 @@ type replicator struct {
 	DB           *leveldb.DB
 	Username     string
 	Password     string
+	Events       chan<- *data.Event
 }
 
 func (r *replicator) replicate() {
@@ -171,6 +172,9 @@ func (r *replicator) replicateUntilError() error {
 		}
 
 		log.Printf("replicated %s to %s:%s", event.GetId(), event.GetDrawer(), event.GetFilename())
+
+		log.Printf("forwarding event %s", event.GetId())
+		r.Events <- &event
 	}
 }
 
@@ -287,6 +291,7 @@ func (h *replHandler) handleWebsocket(conn *websocket.Conn) {
 		}
 
 		for event := range rawEvents {
+			log.Printf("websocketHandler: forwarding event")
 			if err := websocket.Message.Send(conn, event); err != nil {
 				log.Printf("Sending event failed: %v", err)
 				return
@@ -324,6 +329,7 @@ func cacheEvents(incomingEvents <-chan *data.Event, outgoingEvents chan<- []byte
 				if err != nil {
 					return
 				}
+				log.Printf("cacheEvents: storing event %s", e.GetId())
 				cachedEvents = append(cachedEvents, rawData)
 			case <-quit:
 				return
@@ -337,8 +343,10 @@ func cacheEvents(incomingEvents <-chan *data.Event, outgoingEvents chan<- []byte
 				if err != nil {
 					return
 				}
+				log.Printf("cacheEvents: storing event %s", e.GetId())
 				cachedEvents = append(cachedEvents, rawData)
 			case outgoingEvents <- cachedEvents[0]:
+				log.Printf("cacheEvents: forwarding event")
 				cachedEvents = cachedEvents[1:]
 			case <-quit:
 				return

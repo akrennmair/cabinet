@@ -24,12 +24,13 @@ import (
 
 func main() {
 	var (
-		listenAddr = flag.String("listen", "localhost:8080", "listen address")
-		dataFile   = flag.String("datafile", "./data.db", "path to data file")
-		username   = flag.String("user", "admin", "user name for operations requiring authentication")
-		password   = flag.String("pass", "", "password for operations requiring authentication")
-		frontend   = flag.String("frontend", "", "front-facing URL for the file delivery")
-		parent     = flag.String("parent", "", "parent server URL, e.g. http://otherserver:8080")
+		listenAddr  = flag.String("listen", "localhost:8080", "listen address")
+		dataFile    = flag.String("datafile", "./data.db", "path to data file")
+		username    = flag.String("user", "admin", "user name for operations requiring authentication")
+		password    = flag.String("pass", "", "password for operations requiring authentication")
+		frontend    = flag.String("frontend", "", "front-facing URL for the file delivery")
+		parent      = flag.String("parent", "", "parent server URL, e.g. http://otherserver:8080")
+		forceParent = flag.Bool("forceparent", false, "if enabled, forces instance to act as a parent even though it replicates from another parent server")
 	)
 
 	flag.Parse()
@@ -57,7 +58,8 @@ func main() {
 
 	// start replication from parent server when in child mode.
 	if *parent != "" {
-		r := replicator{ParentServer: *parent, DB: db, Username: *username, Password: *password}
+		log.Printf("Starting replication from %s", *parent)
+		r := replicator{ParentServer: *parent, DB: db, Username: *username, Password: *password, Events: events}
 		go r.replicate()
 	}
 
@@ -66,12 +68,12 @@ func main() {
 	go dispatchEvents(events, replRequests)
 
 	// only enable upload when in parent mode.
-	if *parent == "" {
+	if *parent == "" || *forceParent {
 		http.Handle("/api/upload", &uploadFileHandler{DB: db, Frontend: *frontend, Events: events, Username: *username, Password: *password})
 	}
 	repl := &replHandler{DB: db, Username: *username, Password: *password, Replicator: replRequests}
 	http.Handle("/api/repl", websocket.Handler(repl.handleWebsocket))
-	http.Handle("/", &fileHandler{DB: db, Events: events, Username: *username, Password: *password, ChildMode: *parent != ""})
+	http.Handle("/", &fileHandler{DB: db, Events: events, Username: *username, Password: *password, ChildMode: (*parent != "" && !*forceParent)})
 
 	log.Fatal(http.ListenAndServe(*listenAddr, nil))
 }
