@@ -1,6 +1,7 @@
 package main
 
 import (
+	"expvar"
 	"fmt"
 	"golang.org/x/net/websocket"
 	"io/ioutil"
@@ -11,10 +12,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/akrennmair/cabinet/basicauth"
 	"github.com/akrennmair/cabinet/data"
 	"github.com/golang/protobuf/proto"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/util"
+)
+
+var (
+	replEvents        = expvar.NewInt("cabinet.repl.events")
+	replIgnoredEvents = expvar.NewInt("cabinet.repl.ignoredevents")
+	replErrors        = expvar.NewInt("cabinet.repl.errors")
+	replChildren      = expvar.NewInt("cabinet.repl.children")
 )
 
 func dispatchEvents(events <-chan *data.Event, replRequests <-chan replRequest) {
@@ -42,9 +51,9 @@ func dispatchEvents(events <-chan *data.Event, replRequests <-chan replRequest) 
 type replicator struct {
 	ParentServer string
 	DB           *leveldb.DB
+	Events       chan<- *data.Event
 	Username     string
 	Password     string
-	Events       chan<- *data.Event
 }
 
 func (r *replicator) replicate() {
@@ -53,6 +62,7 @@ func (r *replicator) replicate() {
 		ts := time.Now()
 		err := r.replicateUntilError()
 		if err != nil {
+			replErrors.Add(1)
 			log.Printf("Replication error: %v", err)
 			if time.Since(ts) < 5*time.Second {
 				if count < 5 {
@@ -133,8 +143,11 @@ func (r *replicator) replicateUntilError() error {
 			return err
 		}
 
+		replEvents.Add(1)
+
 		if haveEvent, _ := r.DB.Has([]byte(event.GetId()), nil); haveEvent {
 			log.Printf("ignoring duplicate event %s", event.GetId())
+			replIgnoredEvents.Add(1)
 			continue
 		}
 
@@ -197,9 +210,8 @@ func (r *replicator) downloadFile(uri string) (content []byte, contentType strin
 
 type replHandler struct {
 	DB         *leveldb.DB
-	Username   string
-	Password   string
 	Replicator chan<- replRequest
+	AuthFunc   basicauth.AuthenticatorFunc
 }
 
 type replRequest struct {
@@ -215,9 +227,12 @@ const (
 )
 
 func (h *replHandler) handleWebsocket(conn *websocket.Conn) {
-	if !basicAuth(nil, conn.Request(), h.Username, h.Password) {
+	if !basicauth.Authenticate(nil, conn.Request(), h.AuthFunc) {
 		return
 	}
+
+	replChildren.Add(1)
+	defer replChildren.Add(-1)
 
 	var msg []byte
 

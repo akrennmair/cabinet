@@ -1,9 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"expvar"
 	"flag"
 	"io"
 	"io/ioutil"
@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/akrennmair/cabinet/basicauth"
 	"github.com/akrennmair/cabinet/data"
 	"github.com/akrennmair/gouuid"
 	"github.com/golang/protobuf/proto"
@@ -54,6 +55,14 @@ func main() {
 		log.Fatalf("leveldb.OpenFile %s failed: %v", *dataFile, err)
 	}
 
+	expvar.Publish("leveldb.stats", expvar.Func(func() interface{} { stats, _ := db.GetProperty("leveldb.stats"); return stats }))
+	expvar.Publish("leveldb.sstables", expvar.Func(func() interface{} { stats, _ := db.GetProperty("leveldb.sstables"); return stats }))
+	expvar.Publish("leveldb.blockpool", expvar.Func(func() interface{} { stats, _ := db.GetProperty("leveldb.blockpool"); return stats }))
+	expvar.Publish("leveldb.cachedblock", expvar.Func(func() interface{} { stats, _ := db.GetProperty("leveldb.cachedblock"); return stats }))
+	expvar.Publish("leveldb.openedtables", expvar.Func(func() interface{} { stats, _ := db.GetProperty("leveldb.openedtables"); return stats }))
+	expvar.Publish("leveldb.alivesnaps", expvar.Func(func() interface{} { stats, _ := db.GetProperty("leveldb.alivesnaps"); return stats }))
+	expvar.Publish("leveldb.aliveiters", expvar.Func(func() interface{} { stats, _ := db.GetProperty("leveldb.aliveiters"); return stats }))
+
 	events := make(chan *data.Event)
 
 	// start replication from parent server when in child mode.
@@ -67,24 +76,35 @@ func main() {
 
 	go dispatchEvents(events, replRequests)
 
+	authFunc := func(u, p string) bool {
+		return u == *username && p == *password
+	}
+
 	// only enable upload when in parent mode.
 	if *parent == "" || *forceParent {
-		http.Handle("/api/upload", &uploadFileHandler{DB: db, Frontend: *frontend, Events: events, Username: *username, Password: *password})
+		http.Handle("/api/upload", &uploadFileHandler{DB: db, Frontend: *frontend, Events: events, AuthFunc: authFunc})
 	}
-	repl := &replHandler{DB: db, Username: *username, Password: *password, Replicator: replRequests}
+	repl := &replHandler{DB: db, AuthFunc: authFunc, Replicator: replRequests}
 	http.Handle("/api/repl", websocket.Handler(repl.handleWebsocket))
-	http.Handle("/", &fileHandler{DB: db, Events: events, Username: *username, Password: *password, ChildMode: (*parent != "" && !*forceParent)})
+	http.Handle("/", &fileHandler{DB: db, Events: events, AuthFunc: authFunc, ChildMode: (*parent != "" && !*forceParent)})
 
-	log.Fatal(http.ListenAndServe(*listenAddr, nil))
+	mux := basicauth.NewHandler(http.DefaultServeMux, authFunc, []string{"/debug/vars"})
+
+	log.Fatal(http.ListenAndServe(*listenAddr, mux))
 }
 
 type fileHandler struct {
 	DB        *leveldb.DB
 	Events    chan<- *data.Event
-	Username  string
-	Password  string
 	ChildMode bool
+	AuthFunc  basicauth.AuthenticatorFunc
 }
+
+var (
+	deleteCount  = expvar.NewInt("cabinet.delete.count")
+	deliverCount = expvar.NewInt("cabinet.deliver.count")
+	uploadCount  = expvar.NewInt("cabinet.upload.count")
+)
 
 func (h *fileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -144,10 +164,12 @@ func (h *fileHandler) deliverFile(w http.ResponseWriter, r *http.Request) {
 	if _, err := w.Write(fileContent); err != nil {
 		log.Printf("delivery of %s:%s failed: %v", drawer, filename, err)
 	}
+
+	deliverCount.Add(1)
 }
 
 func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request) {
-	if !basicAuth(w, r, h.Username, h.Password) {
+	if !basicauth.Authenticate(w, r, h.AuthFunc) {
 		return
 	}
 
@@ -196,14 +218,15 @@ func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 	h.Events <- event
+
+	deleteCount.Add(1)
 }
 
 type uploadFileHandler struct {
 	DB       *leveldb.DB
 	Frontend string
 	Events   chan<- *data.Event
-	Username string
-	Password string
+	AuthFunc basicauth.AuthenticatorFunc
 }
 
 func (h *uploadFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -212,7 +235,7 @@ func (h *uploadFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !basicAuth(w, r, h.Username, h.Password) {
+	if !basicauth.Authenticate(w, r, h.AuthFunc) {
 		return
 	}
 
@@ -315,31 +338,8 @@ func (h *uploadFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, event := range events {
 		h.Events <- event
 	}
-}
 
-func basicAuth(w http.ResponseWriter, r *http.Request, user, pass string) bool {
-	const basicAuthPrefix string = "Basic "
-
-	// Get the Basic Authentication credentials
-	auth := r.Header.Get("Authorization")
-	if strings.HasPrefix(auth, basicAuthPrefix) {
-		// Check credentials
-		payload, err := base64.StdEncoding.DecodeString(auth[len(basicAuthPrefix):])
-		if err == nil {
-			pair := bytes.SplitN(payload, []byte(":"), 2)
-			if len(pair) == 2 && bytes.Equal(pair[0], []byte(user)) && bytes.Equal(pair[1], []byte(pass)) {
-				// Delegate request to the given handle
-				return true
-			}
-		}
-	}
-
-	if w != nil {
-		// Request Basic Authentication otherwise
-		w.Header().Set("WWW-Authenticate", "Basic realm=Restricted")
-		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
-	}
-	return false
+	uploadCount.Add(1)
 }
 
 func basicAuthEncode(user, pass string) string {
