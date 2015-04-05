@@ -97,6 +97,7 @@ func (m *Event) GetId() string {
 
 type MetaData struct {
 	ContentType      *string `protobuf:"bytes,1,req,name=content_type" json:"content_type,omitempty"`
+	Source           *string `protobuf:"bytes,2,opt,name=source" json:"source,omitempty"`
 	XXX_unrecognized []byte  `json:"-"`
 }
 
@@ -107,6 +108,13 @@ func (*MetaData) ProtoMessage()    {}
 func (m *MetaData) GetContentType() string {
 	if m != nil && m.ContentType != nil {
 		return *m.ContentType
+	}
+	return ""
+}
+
+func (m *MetaData) GetSource() string {
+	if m != nil && m.Source != nil {
+		return *m.Source
 	}
 	return ""
 }

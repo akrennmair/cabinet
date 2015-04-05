@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"expvar"
 	"flag"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -82,7 +84,9 @@ func main() {
 
 	// only enable upload when in parent mode.
 	if *parent == "" || *forceParent {
-		http.Handle("/api/upload", &uploadFileHandler{DB: db, Frontend: *frontend, Events: events, AuthFunc: authFunc})
+		uploadHandler := &uploadFileHandler{DB: db, Frontend: *frontend, Events: events, AuthFunc: authFunc}
+		http.Handle("/api/upload", uploadHandler)
+		http.Handle("/api/store", uploadHandler)
 	}
 	repl := &replHandler{DB: db, AuthFunc: authFunc, Replicator: replRequests}
 	http.Handle("/api/repl", websocket.Handler(repl.handleWebsocket))
@@ -161,6 +165,10 @@ func (h *fileHandler) deliverFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", metadata.GetContentType())
+	if metadata.Source != nil {
+		w.Header().Set("Content-Location", metadata.GetSource())
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(int64(len(fileContent)), 10))
 	if _, err := w.Write(fileContent); err != nil {
 		log.Printf("delivery of %s:%s failed: %v", drawer, filename, err)
 	}
@@ -230,15 +238,116 @@ type uploadFileHandler struct {
 }
 
 func (h *uploadFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
 
 	if !basicauth.Authenticate(w, r, h.AuthFunc) {
 		return
 	}
 
+	pathFields := strings.Split(r.URL.Path, "/")
+	apiEndpoint := pathFields[len(pathFields)-1]
+
+	switch apiEndpoint {
+	case "upload":
+		if r.Method != "POST" {
+			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+			return
+		}
+		h.upload(w, r)
+	case "store":
+		if r.Method != "GET" {
+			log.Printf("Method = %s", r.Method)
+			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+			return
+		}
+		h.store(w, r)
+	default:
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+	}
+}
+
+func (h *uploadFileHandler) store(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "parsing form failed: "+err.Error(), http.StatusNotAcceptable)
+		return
+	}
+
+	uri := r.FormValue("url")
+	if uri == "" {
+		http.Error(w, "empty url parameter", http.StatusNotAcceptable)
+		return
+	}
+	parsedURI, err := url.Parse(uri)
+	if err != nil {
+		http.Error(w, "invalid URL: "+err.Error(), http.StatusNotAcceptable)
+		return
+	}
+
+	drawerName := r.FormValue("drawer")
+	if drawerName == "" {
+		http.Error(w, "invalid drawer name", http.StatusNotAcceptable)
+		return
+	}
+
+	var buf bytes.Buffer
+	resp, err := http.Get(uri)
+	if err != nil {
+		http.Error(w, "Fetching URL failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	if _, err := io.Copy(&buf, resp.Body); err != nil {
+		http.Error(w, "Reading HTTP body failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	filename := gouuid.New().ShortString()
+	if extension := r.Form.Get("ext"); extension != "" {
+		filename += "." + extension
+	} else if n := strings.LastIndex(parsedURI.Path, "."); n != -1 {
+		filename += parsedURI.Path[n:]
+	}
+
+	batch := new(leveldb.Batch)
+
+	var metadata data.MetaData
+	metadata.ContentType = proto.String(resp.Header.Get("Content-Type"))
+	metadata.Source = proto.String(uri)
+	rawMetaData, err := proto.Marshal(&metadata)
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		log.Printf("proto.Marshal failed: %v", err)
+		return
+	}
+
+	batch.Put([]byte("file:"+drawerName+":"+filename), buf.Bytes())
+	batch.Put([]byte("meta:"+drawerName+":"+filename), rawMetaData)
+
+	eventKey := "event:" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	event := &data.Event{
+		Type:     data.Event_UPLOAD.Enum(),
+		Drawer:   proto.String(drawerName),
+		Filename: proto.String(filename),
+		Id:       proto.String(eventKey),
+	}
+	eventData, err := proto.Marshal(event)
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+	batch.Put([]byte(eventKey), eventData)
+	batch.Put([]byte("latest_event"), []byte(eventKey))
+
+	if err := h.DB.Write(batch, nil); err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		log.Printf("store transaction failed: %v", err)
+		return
+	}
+
+	fmt.Fprintf(w, "%s/%s/%s", h.Frontend, drawerName, filename)
+}
+
+func (h *uploadFileHandler) upload(w http.ResponseWriter, r *http.Request) {
 	ts := time.Now()
 	defer func() {
 		duration := time.Since(ts)

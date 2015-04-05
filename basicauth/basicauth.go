@@ -17,8 +17,9 @@ type AuthenticatorFunc func(username, password string) bool
 
 func NewHandler(h http.Handler, authFunc AuthenticatorFunc, endpoints []string) *Handler {
 	authHandler := &Handler{
-		h:        h,
-		authFunc: authFunc,
+		h:         h,
+		authFunc:  authFunc,
+		endpoints: make(map[string]struct{}),
 	}
 	for _, e := range endpoints {
 		authHandler.endpoints[e] = struct{}{}

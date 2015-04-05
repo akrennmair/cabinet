@@ -157,14 +157,12 @@ func (r *replicator) replicateUntilError() error {
 
 		switch event.GetType() {
 		case data.Event_UPLOAD:
-			fileContent, mimeType, err := r.downloadFile(r.ParentServer + "/" + event.GetDrawer() + "/" + event.GetFilename())
+			fileContent, metadata, err := r.downloadFile(r.ParentServer + "/" + event.GetDrawer() + "/" + event.GetFilename())
 			if err != nil {
 				log.Printf("Error downloading %s:%s, ignoring file: %v", event.GetDrawer(), event.GetFilename(), err)
 			} else {
 				batch.Put([]byte("file:"+event.GetDrawer()+":"+event.GetFilename()), fileContent)
 
-				var metadata data.MetaData
-				metadata.ContentType = proto.String(mimeType)
 				rawMetaData, err := proto.Marshal(&metadata)
 				if err != nil {
 					log.Printf("marshalling meta data failed: %v", err)
@@ -191,21 +189,24 @@ func (r *replicator) replicateUntilError() error {
 	}
 }
 
-func (r *replicator) downloadFile(uri string) (content []byte, contentType string, err error) {
+func (r *replicator) downloadFile(uri string) (content []byte, metadata data.MetaData, err error) {
 	resp, err := http.Get(uri)
 	if err != nil {
-		return nil, "", err
+		return nil, metadata, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("%s returned %d", uri, resp.StatusCode)
+		return nil, metadata, fmt.Errorf("%s returned %d", uri, resp.StatusCode)
 	}
 	content, err = ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, "", err
+		return nil, metadata, err
 	}
-	contentType = resp.Header.Get("Content-Type")
-	return content, contentType, nil
+	metadata.ContentType = proto.String(resp.Header.Get("Content-Type"))
+	if source := resp.Header.Get("Content-Location"); source != "" {
+		metadata.Source = proto.String(source)
+	}
+	return content, metadata, nil
 }
 
 type replHandler struct {

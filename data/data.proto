@@ -15,6 +15,7 @@ message Event {
 
 message MetaData {
 	required string content_type = 1;
+	optional string source = 2;
 }
 
 message ReplicationStart {

@@ -18,6 +18,11 @@ frontend address is required for generating complete URLs in the upload API.
 To delete files, the same URL as was returned by the upload API needs to be 
 called with the HTTP `DELETE` method and authentication like the upload API.
 
+To store files from external URLs, use `GET 
+/api/store?url=$URL&drawer=$DRAWER`. The resulting URL is returned in the HTTP 
+response body. The original URL is preserved and returned on subsequent 
+requests on the new URL in the `Content-Location` response header.
+
 ## Replication
 
 cabinet implements a replication scheme. By default, a cabinet instance acts as 
