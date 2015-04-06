@@ -225,7 +225,9 @@ func (h *fileHandler) deleteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-	h.Events <- event
+	if h.Events != nil {
+		h.Events <- event
+	}
 
 	deleteCount.Add(1)
 }
@@ -444,8 +446,10 @@ func (h *uploadFileHandler) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for _, event := range events {
-		h.Events <- event
+	if h.Events != nil {
+		for _, event := range events {
+			h.Events <- event
+		}
 	}
 
 	uploadCount.Add(1)
