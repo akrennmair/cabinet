@@ -285,7 +285,7 @@ func (h *uploadFileHandler) store(w http.ResponseWriter, r *http.Request) {
 	}
 
 	drawerName := r.FormValue("drawer")
-	if drawerName == "" {
+	if drawerName == "" || !validDrawerName(drawerName) {
 		http.Error(w, "invalid drawer name", http.StatusNotAcceptable)
 		return
 	}
@@ -362,7 +362,7 @@ func (h *uploadFileHandler) upload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	drawerName := r.Form.Get("drawer")
-	if drawerName == "" {
+	if drawerName == "" || !validDrawerName(drawerName) {
 		http.Error(w, "no valid drawer name provided", http.StatusNotAcceptable)
 		return
 	}
@@ -457,4 +457,13 @@ func (h *uploadFileHandler) upload(w http.ResponseWriter, r *http.Request) {
 
 func basicAuthEncode(user, pass string) string {
 	return base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+}
+
+func validDrawerName(drawer string) bool {
+	for _, r := range drawer {
+		if !strings.ContainsRune("abcefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789..:,;$-", r) {
+			return false
+		}
+	}
+	return true
 }
